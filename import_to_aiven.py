@@ -16,10 +16,12 @@ import re
 import ssl
 import sys
 import unicodedata
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 try:  # Keep --help and pure input validation usable without PyMySQL installed.
     import pymysql
@@ -30,6 +32,7 @@ except ImportError:  # pragma: no cover - exercised only in a minimal install.
 MAX_BATCH = 500
 MAX_IDENTIFIER_LENGTH = 64
 MAX_ID_LENGTH = 255
+LOG_TABLE = "import_log"
 
 CONFIG_KEYS = (
     "AIVEN_HOST",
@@ -39,6 +42,8 @@ CONFIG_KEYS = (
     "AIVEN_PASSWORD",
     "AIVEN_CA_CERT",
 )
+
+REQUIRED_CONFIG_KEYS = tuple(key for key in CONFIG_KEYS if key != "AIVEN_CA_CERT")
 
 
 class ImporterError(Exception):
@@ -89,6 +94,7 @@ class Dataset:
     columns: tuple[Column, ...]
     rows: tuple[Record, ...]
     id_source_name: str
+    mergeable: bool = False
 
     @property
     def id_column(self) -> str:
@@ -111,7 +117,7 @@ class AivenConfig:
     database: str
     user: str
     password: str
-    ca_cert: Path
+    ca_cert: Path | None
 
 
 @dataclass(frozen=True)
@@ -139,13 +145,10 @@ class TableState:
 
 
 @dataclass(frozen=True)
-class DatasetPlan:
-    dataset: Dataset
-    state: TableState
-    create_table: bool
-    add_columns: tuple[str, ...]
-    inserts: int = 0
-    updates: int = 0
+class ImportGroup:
+    table: str
+    path: Path
+    files: tuple[Path, ...]
 
 
 class JsonNumber:
@@ -322,8 +325,10 @@ def _load_json(path: Path, id_source_name: str, table: str) -> Dataset:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
         raise InputError("não foi possível ler o JSON") from exc
+    if isinstance(value, dict) and {"t", "NReg", "Consumo", "metadata"} <= value.keys():
+        return _load_baze_json(path, id_source_name, table, value)
     if not isinstance(value, list):
-        raise InputError("JSON deve ser uma lista de objetos")
+        raise InputError("JSON deve ser uma lista de objetos ou um objeto Baze")
     if any(not isinstance(item, dict) for item in value):
         raise InputError("JSON deve ser uma lista de objetos")
 
@@ -360,28 +365,74 @@ def _load_json(path: Path, id_source_name: str, table: str) -> Dataset:
     return Dataset(path, table, columns, tuple(rows), id_source_name)
 
 
-def discover_input_files(input_path: str | Path) -> tuple[Path, ...]:
-    path = Path(input_path)
-    if not path.exists():
-        raise InputError("INPUT não existe")
-    if path.is_dir():
-        files = [
-            child
-            for child in path.iterdir()
-            if child.is_file() and child.suffix.lower() in {".csv", ".json"}
-        ]
-        files.sort(key=lambda item: (item.name.casefold(), item.name))
-        if not files:
-            raise InputError("diretório sem CSV/JSON diretamente contido")
-        return tuple(files)
-    if path.is_file() and path.suffix.lower() in {".csv", ".json"}:
-        return (path,)
-    raise InputError("INPUT deve ser CSV, JSON ou diretório")
+def _load_baze_json(
+    path: Path, id_source_name: str, table: str, value: Mapping[str, Any]
+) -> Dataset:
+    metadata = value.get("metadata")
+    if not isinstance(metadata, dict):
+        raise InputError("JSON Baze sem metadata válida")
+    if "cpe" not in metadata:
+        raise InputError("JSON Baze sem metadata.cpe")
+
+    cpe = _json_value(metadata["cpe"])
+    if not cpe:
+        raise InputError("JSON Baze com metadata.cpe vazio")
+    timestamps = value["t"]
+    record_counts = value["NReg"]
+    consumptions = value["Consumo"]
+    if not all(isinstance(series, list) for series in (timestamps, record_counts, consumptions)):
+        raise InputError("t, NReg e Consumo devem ser listas no JSON Baze")
+    if len(timestamps) != len(record_counts) or len(timestamps) != len(consumptions):
+        raise InputError("t, NReg e Consumo têm comprimentos diferentes no JSON Baze")
+
+    source_names = [id_source_name, "cpe", "t", "NReg", "Consumo", "ag"]
+    source_names.extend(name for name in metadata if name != "cpe")
+    columns = _columns_from_source_names(source_names)
+    by_source = {column.source_name: column.name for column in columns}
+    aggregation = _json_value(value.get("ag"))
+    metadata_values = {
+        by_source[name]: _json_value(raw_value)
+        for name, raw_value in metadata.items()
+        if name != "cpe"
+    }
+
+    rows: list[Record] = []
+    seen_ids: set[str] = set()
+    for raw_timestamp, raw_count, raw_consumption in zip(
+        timestamps, record_counts, consumptions
+    ):
+        timestamp = _json_value(raw_timestamp)
+        if not timestamp:
+            raise InputError("JSON Baze com instante vazio")
+        record_id = _validate_id_text(f"{cpe}|{timestamp}", seen_ids)
+        normalized = {
+            by_source[id_source_name]: record_id,
+            by_source["cpe"]: cpe,
+            by_source["t"]: timestamp,
+            by_source["NReg"]: _json_value(raw_count),
+            by_source["Consumo"]: _json_value(raw_consumption),
+            by_source["ag"]: aggregation,
+            **metadata_values,
+        }
+        rows.append(Record(normalized))
+
+    return Dataset(
+        path,
+        table,
+        columns,
+        tuple(rows),
+        id_source_name,
+        mergeable=True,
+    )
 
 
-def load_input_file(path: str | Path, id_source_name: str = "id") -> Dataset:
+def load_input_file(
+    path: str | Path,
+    id_source_name: str = "id",
+    table_name: str | None = None,
+) -> Dataset:
     file_path = Path(path)
-    table = _table_name(file_path)
+    table = table_name or _table_name(file_path)
     if file_path.suffix.lower() == ".csv":
         return _load_csv(file_path, id_source_name, table)
     if file_path.suffix.lower() == ".json":
@@ -389,19 +440,108 @@ def load_input_file(path: str | Path, id_source_name: str = "id") -> Dataset:
     raise InputError("ficheiro com extensão não suportada")
 
 
-def load_datasets(input_path: str | Path, id_source_name: str = "id") -> tuple[Dataset, ...]:
-    if not isinstance(id_source_name, str) or not id_source_name:
-        raise InputError("--id-column não pode ser vazio")
-    files = discover_input_files(input_path)
-    table_names: dict[str, Path] = {}
-    for file_path in files:
-        table = _table_name(file_path)
+def _merge_datasets(
+    datasets: Sequence[Dataset], source_path: Path | None = None
+) -> Dataset:
+    first = datasets[0]
+    if any(dataset.table.casefold() != first.table.casefold() for dataset in datasets):
+        raise InputError("não é possível juntar ficheiros destinados a tabelas diferentes")
+    if any(dataset.id_source_name != first.id_source_name for dataset in datasets):
+        raise InputError("tabelas Baze com colunas de ID incompatíveis")
+
+    source_names: list[str] = []
+    seen_sources: set[str] = set()
+    for dataset in datasets:
+        for column in dataset.columns:
+            if column.source_name not in seen_sources:
+                seen_sources.add(column.source_name)
+                source_names.append(column.source_name)
+    columns = _columns_from_source_names(source_names)
+
+    rows_by_id: dict[str, dict[str, str | None]] = {}
+    id_column = first.id_column
+    for dataset in datasets:
+        for record in dataset.rows:
+            record_id = str(record.values[id_column])
+            if record_id not in rows_by_id:
+                rows_by_id[record_id] = dict(record.values)
+                continue
+            merged = rows_by_id[record_id]
+            for name, value in record.values.items():
+                if name not in merged or merged[name] is None:
+                    merged[name] = value
+                elif value is not None and merged[name] != value:
+                    raise InputError("ID Baze duplicado com valores incompatíveis")
+
+    return Dataset(
+        source_path or first.path.parent,
+        first.table,
+        columns,
+        tuple(Record(values) for values in rows_by_id.values()),
+        first.id_source_name,
+        mergeable=True,
+    )
+
+
+def discover_import_groups(data_path: str | Path = "data") -> tuple[ImportGroup, ...]:
+    root = Path(data_path)
+    if not root.is_dir():
+        raise InputError("a pasta data não existe")
+
+    groups: list[ImportGroup] = []
+    table_names: set[str] = set()
+    children = sorted(root.iterdir(), key=lambda item: (item.name.casefold(), item.name))
+    for child in children:
+        if child.is_file() and child.suffix.lower() in {".csv", ".json"}:
+            table = _table_name(child)
+            files = (child,)
+        elif child.is_dir():
+            files = tuple(
+                sorted(
+                    (
+                        file_path
+                        for file_path in child.rglob("*")
+                        if file_path.is_file()
+                        and file_path.suffix.lower() in {".csv", ".json"}
+                    ),
+                    key=lambda item: (str(item).casefold(), str(item)),
+                )
+            )
+            if not files:
+                continue
+            table = sanitize_identifier(child.name)
+        else:
+            continue
+
         folded = table.casefold()
+        if folded == LOG_TABLE.casefold():
+            raise InputError(f"o nome {LOG_TABLE} está reservado para a tabela de log")
         if folded in table_names:
-            raise InputError("colisão de tabelas após sanitização")
-        table_names[folded] = file_path
-    datasets = tuple(load_input_file(file_path, id_source_name) for file_path in files)
-    return datasets
+            raise InputError("duas entradas da pasta data originam a mesma tabela")
+        table_names.add(folded)
+        groups.append(ImportGroup(table, child, files))
+
+    if not groups:
+        raise InputError("a pasta data não contém CSV ou JSON")
+    return tuple(groups)
+
+
+def load_import_group(group: ImportGroup, id_source_name: str = "id") -> Dataset:
+    datasets = [
+        load_input_file(file_path, id_source_name, group.table)
+        for file_path in group.files
+    ]
+    if len(datasets) == 1:
+        dataset = datasets[0]
+        return Dataset(
+            group.path,
+            group.table,
+            dataset.columns,
+            dataset.rows,
+            dataset.id_source_name,
+            dataset.mergeable,
+        )
+    return _merge_datasets(datasets, group.path)
 
 
 def _is_placeholder(value: str) -> bool:
@@ -453,16 +593,18 @@ def _parse_env_file(path: Path) -> dict[str, str]:
         if key in values:
             raise ConfigError("variável repetida em .env")
         values[key] = value
-    missing = [key for key in CONFIG_KEYS if key not in values]
+    missing = [key for key in REQUIRED_CONFIG_KEYS if key not in values]
     if missing:
-        raise ConfigError(".env sem variáveis Aiven obrigatórias")
+        raise ConfigError(
+            ".env sem variáveis Aiven obrigatórias: " + ", ".join(missing)
+        )
     return values
 
 
 def load_config(env_path: str | Path = ".env") -> AivenConfig:
     env_file = Path(env_path)
     values = _parse_env_file(env_file)
-    for key in CONFIG_KEYS:
+    for key in REQUIRED_CONFIG_KEYS:
         if _is_placeholder(values[key]):
             raise ConfigError(f"{key} vazio ou placeholder")
         if "\x00" in values[key]:
@@ -473,11 +615,16 @@ def load_config(env_path: str | Path = ".env") -> AivenConfig:
         raise ConfigError("AIVEN_PORT inválido") from exc
     if not 1 <= port <= 65535:
         raise ConfigError("AIVEN_PORT fora do intervalo")
-    ca_cert = Path(values["AIVEN_CA_CERT"]).expanduser()
-    if not ca_cert.is_absolute():
-        ca_cert = env_file.parent / ca_cert
-    if not ca_cert.is_file():
-        raise ConfigError("AIVEN_CA_CERT não aponta para um ficheiro")
+    ca_cert: Path | None = None
+    ca_value = values.get("AIVEN_CA_CERT", "").strip()
+    if ca_value:
+        if _is_placeholder(ca_value) or "\x00" in ca_value:
+            raise ConfigError("AIVEN_CA_CERT inválido")
+        ca_cert = Path(ca_value).expanduser()
+        if not ca_cert.is_absolute():
+            ca_cert = env_file.parent / ca_cert
+        if not ca_cert.is_file():
+            raise ConfigError("AIVEN_CA_CERT não aponta para um ficheiro")
     return AivenConfig(
         host=values["AIVEN_HOST"],
         port=port,
@@ -488,19 +635,29 @@ def load_config(env_path: str | Path = ".env") -> AivenConfig:
     )
 
 
-def make_ssl_context(ca_cert: str | Path) -> ssl.SSLContext:
+def make_ssl_context(ca_cert: str | Path | None = None) -> ssl.SSLContext:
     try:
-        context = ssl.create_default_context(cafile=str(ca_cert))
-        context.verify_mode = ssl.CERT_REQUIRED
-        context.check_hostname = True
+        if ca_cert is None:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        else:
+            context = ssl.create_default_context(cafile=str(ca_cert))
+            context.verify_mode = ssl.CERT_REQUIRED
+            context.check_hostname = True
     except (OSError, ssl.SSLError, ValueError) as exc:
-        raise ConfigError("não foi possível configurar TLS com o CA indicado") from exc
+        raise ConfigError("não foi possível configurar TLS") from exc
     return context
 
 
 def connect_to_aiven(config: AivenConfig) -> Any:
     if pymysql is None:
         raise ConfigError("PyMySQL não está instalado")
+    if config.ca_cert is None:
+        print(
+            "Aviso: ligação TLS cifrada sem validação do certificado do servidor.",
+            file=sys.stderr,
+        )
     context = make_ssl_context(config.ca_cert)
     try:
         return pymysql.connect(
@@ -518,7 +675,10 @@ def connect_to_aiven(config: AivenConfig) -> Any:
         )
     except Exception as exc:
         # Do not relay driver messages: some drivers include a DSN or secret.
-        raise RemoteError("não foi possível ligar à base de dados") from exc
+        raise RemoteError(
+            "não foi possível ligar à base de dados; confirme as credenciais "
+            "e, se o servidor usar uma CA privada, configure AIVEN_CA_CERT"
+        ) from exc
 
 
 def _quote_identifier(identifier: str) -> str:
@@ -640,7 +800,7 @@ def _fetch_table_state(connection: Any, database: str, table: str) -> TableState
 _INTEGER_TYPES = {"tinyint", "smallint", "mediumint", "int", "integer", "bigint"}
 
 
-def _validate_existing_state(dataset: Dataset, state: TableState, add_columns: bool) -> tuple[str, ...]:
+def _validate_existing_state(dataset: Dataset, state: TableState) -> None:
     if not state.exists:
         return ()
     if (state.engine or "").casefold() != "innodb":
@@ -680,22 +840,10 @@ def _validate_existing_state(dataset: Dataset, state: TableState, add_columns: b
             missing.append(column.name)
         elif "generated" in info.extra.casefold() or info.generation_expression:
             raise SchemaError("não é permitido escrever em colunas generated")
-    if missing and not add_columns:
-        raise SchemaError("faltam colunas; use --add-columns para autorizar o DDL")
-    return tuple(missing)
-
-
-def preflight_table(
-    connection: Any,
-    database: str,
-    dataset: Dataset,
-    *,
-    add_columns: bool = False,
-) -> tuple[TableState, tuple[str, ...]]:
-    state = _fetch_table_state(connection, database, dataset.table)
-    if not state.exists:
-        return state, ()
-    return state, _validate_existing_state(dataset, state, add_columns)
+    if missing:
+        raise SchemaError(
+            "a tabela existente não contém as colunas: " + ", ".join(missing)
+        )
 
 
 def build_create_table_sql(dataset: Dataset) -> str:
@@ -709,13 +857,6 @@ def build_create_table_sql(dataset: Dataset) -> str:
         + ", ".join(definitions)
         + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"
     )
-
-
-def build_add_columns_sql(dataset: Dataset, columns: Sequence[str]) -> str:
-    if not columns:
-        raise SchemaError("nenhuma coluna para acrescentar")
-    definitions = ", ".join(f"ADD COLUMN {_quote_identifier(name)} TEXT NULL" for name in columns)
-    return f"ALTER TABLE {_quote_identifier(dataset.table)} {definitions}"
 
 
 def build_upsert_sql(dataset: Dataset, present_columns: Sequence[str]) -> str:
@@ -737,45 +878,6 @@ def build_upsert_sql(dataset: Dataset, present_columns: Sequence[str]) -> str:
         f"INSERT INTO {_quote_identifier(dataset.table)} ({quoted_columns}) "
         f"VALUES ({placeholders}) ON DUPLICATE KEY UPDATE {', '.join(assignments)}"
     )
-
-
-def _input_ids(dataset: Dataset) -> tuple[str, ...]:
-    return tuple(str(record.values[dataset.id_column]) for record in dataset.rows)
-
-
-def _db_id_text(value: Any) -> str:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", "strict")
-    return str(value)
-
-
-def existing_ids(connection: Any, dataset: Dataset, state: TableState) -> set[str]:
-    if not dataset.rows:
-        return set()
-    ids = _input_ids(dataset)
-    actual_id = state.columns[dataset.id_column.casefold()].actual_name
-    found: set[str] = set()
-    for start in range(0, len(ids), MAX_BATCH):
-        batch = ids[start : start + MAX_BATCH]
-        placeholders = ", ".join(["%s"] * len(batch))
-        statement = (
-            f"SELECT {_quote_identifier(actual_id)} FROM {_quote_identifier(dataset.table)} "
-            f"WHERE {_quote_identifier(actual_id)} IN ({placeholders})"
-        )
-        try:
-            rows = _read_query(connection, statement, batch)
-        except Exception as exc:
-            raise RemoteError("não foi possível consultar os IDs existentes") from exc
-        for row in rows:
-            value = _first_value(row, 0, actual_id)
-            if value is not None:
-                found.add(_db_id_text(value))
-    return found
-
-
-def _count_predictions(dataset: Dataset, found_ids: set[str]) -> tuple[int, int]:
-    updates = sum(1 for value in _input_ids(dataset) if value in found_ids)
-    return len(dataset.rows) - updates, updates
 
 
 def _group_records(dataset: Dataset) -> Iterator[tuple[tuple[str, ...], list[Record]]]:
@@ -809,65 +911,32 @@ def _execute_upserts(connection: Any, dataset: Dataset) -> None:
         _close_cursor(cursor)
 
 
-def _make_plans(
-    connection: Any,
-    database: str,
-    datasets: Sequence[Dataset],
-    *,
-    create_table: bool,
-    add_columns: bool,
-) -> list[DatasetPlan]:
-    _ensure_strict_mode(connection)
-    plans: list[DatasetPlan] = []
-    for dataset in datasets:
-        state, missing = preflight_table(
-            connection, database, dataset, add_columns=add_columns
-        )
-        if not state.exists and not create_table:
-            raise SchemaError("tabela ausente; use --create-table para autorizar o DDL")
-        plans.append(DatasetPlan(dataset, state, not state.exists, missing))
-    return plans
+def _prepare_target_table(
+    connection: Any, database: str, dataset: Dataset
+) -> str:
+    state = _fetch_table_state(connection, database, dataset.table)
+    if state.exists:
+        _validate_existing_state(dataset, state)
+        statement = f"TRUNCATE TABLE {_quote_identifier(dataset.table)}"
+        operation = "TRUNCATE"
+    else:
+        statement = build_create_table_sql(dataset)
+        operation = "CREATE"
 
-
-def _execute_ddl(connection: Any, plans: Sequence[DatasetPlan]) -> None:
     cursor = connection.cursor()
     try:
-        for plan in plans:
-            statement: str | None = None
-            if plan.create_table:
-                statement = build_create_table_sql(plan.dataset)
-            elif plan.add_columns:
-                statement = build_add_columns_sql(plan.dataset, plan.add_columns)
-            if statement is not None:
-                cursor.execute(statement)
+        cursor.execute(statement)
     except Exception as exc:
-        raise DdlError("falha no DDL; alterações de DDL podem ter persistido") from exc
+        raise DdlError(f"falha ao executar {operation} na tabela") from exc
     finally:
         _close_cursor(cursor)
+    return operation
 
 
-def _revalidate_after_ddl(
-    connection: Any, database: str, plans: Sequence[DatasetPlan]
-) -> list[DatasetPlan]:
-    result: list[DatasetPlan] = []
-    try:
-        for plan in plans:
-            state, missing = preflight_table(
-                connection, database, plan.dataset, add_columns=False
-            )
-            if not state.exists or missing:
-                raise SchemaError("o esquema não corresponde ao DDL executado")
-            result.append(DatasetPlan(plan.dataset, state, plan.create_table, plan.add_columns))
-    except SchemaError as exc:
-        raise DdlError("falha na revalidação do esquema após DDL") from exc
-    return result
-
-
-def _run_dml(connection: Any, plans: Sequence[DatasetPlan]) -> None:
+def _run_dml(connection: Any, dataset: Dataset) -> None:
     try:
         connection.begin()
-        for plan in plans:
-            _execute_upserts(connection, plan.dataset)
+        _execute_upserts(connection, dataset)
         connection.commit()
     except Exception as exc:
         try:
@@ -877,66 +946,173 @@ def _run_dml(connection: Any, plans: Sequence[DatasetPlan]) -> None:
         raise DmlError("falha no DML; a transação foi revertida") from exc
 
 
-def _display_plan(plan: DatasetPlan) -> None:
-    if plan.create_table:
-        ddl = "CREATE TABLE"
-    elif plan.add_columns:
-        ddl = f"ALTER TABLE ADD {len(plan.add_columns)} COLUMN(S)"
-    else:
-        ddl = "none"
-    print(
-        f"{plan.dataset.path} | table={plan.dataset.table} | rows={len(plan.dataset.rows)} "
-        f"| inserts={plan.inserts} | updates={plan.updates} | ddl={ddl}"
+def _ensure_log_table(connection: Any) -> None:
+    statement = (
+        f"CREATE TABLE IF NOT EXISTS {_quote_identifier(LOG_TABLE)} ("
+        "`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, "
+        "`run_id` CHAR(36) NOT NULL, "
+        "`table_name` VARCHAR(64) NOT NULL, "
+        "`source_path` TEXT NOT NULL, "
+        "`operation` VARCHAR(20) NOT NULL, "
+        "`status` VARCHAR(20) NOT NULL, "
+        "`rows_read` BIGINT UNSIGNED NOT NULL DEFAULT 0, "
+        "`rows_inserted` BIGINT UNSIGNED NOT NULL DEFAULT 0, "
+        "`error_message` TEXT NULL, "
+        "`started_at` DATETIME(6) NOT NULL, "
+        "`finished_at` DATETIME(6) NOT NULL, "
+        "PRIMARY KEY (`id`), INDEX `idx_import_log_run` (`run_id`), "
+        "INDEX `idx_import_log_status` (`status`)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"
     )
-
-
-def run_import(
-    datasets: Sequence[Dataset],
-    config: AivenConfig,
-    *,
-    create_table: bool = False,
-    add_columns: bool = False,
-    write: bool = False,
-) -> None:
-    connection = connect_to_aiven(config)
+    cursor = connection.cursor()
     try:
-        plans = _make_plans(
-            connection,
-            config.database,
-            datasets,
-            create_table=create_table,
-            add_columns=add_columns,
-        )
-        if write and any(plan.create_table or plan.add_columns for plan in plans):
-            print("Aviso: DDL pode persistir se o DML falhar depois.", file=sys.stderr)
-            _execute_ddl(connection, plans)
-            plans = _revalidate_after_ddl(connection, config.database, plans)
-        elif not write:
-            # The original state is deliberately retained: dry-run performs
-            # only reads and does not pretend that planned DDL already exists.
+        cursor.execute(statement)
+        connection.commit()
+    except Exception as exc:
+        try:
+            connection.rollback()
+        except Exception:
             pass
+        raise DdlError("não foi possível criar a tabela import_log") from exc
+    finally:
+        _close_cursor(cursor)
 
-        counted: list[DatasetPlan] = []
-        for plan in plans:
-            if plan.state.exists:
-                found = existing_ids(connection, plan.dataset, plan.state)
-            else:
-                found = set()
-            inserts, updates = _count_predictions(plan.dataset, found)
-            counted.append(
-                DatasetPlan(
-                    plan.dataset,
-                    plan.state,
-                    plan.create_table,
-                    plan.add_columns,
-                    inserts,
-                    updates,
+
+def _write_import_log(
+    connection: Any,
+    *,
+    run_id: str,
+    table_name: str,
+    source_path: Path,
+    operation: str,
+    status: str,
+    rows_read: int,
+    rows_inserted: int,
+    error_message: str | None,
+    started_at: datetime,
+) -> None:
+    statement = (
+        f"INSERT INTO {_quote_identifier(LOG_TABLE)} "
+        "(`run_id`, `table_name`, `source_path`, `operation`, `status`, "
+        "`rows_read`, `rows_inserted`, `error_message`, `started_at`, `finished_at`) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+    )
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            statement,
+            (
+                run_id,
+                table_name,
+                str(source_path),
+                operation,
+                status,
+                rows_read,
+                rows_inserted,
+                error_message,
+                started_at,
+                datetime.now(timezone.utc).replace(tzinfo=None),
+            ),
+        )
+        connection.commit()
+    except Exception as exc:
+        try:
+            connection.rollback()
+        except Exception:
+            pass
+        raise RemoteError("não foi possível escrever na tabela import_log") from exc
+    finally:
+        _close_cursor(cursor)
+
+
+def _record_log_safely(connection: Any, **values: Any) -> bool:
+    try:
+        _write_import_log(connection, **values)
+        return True
+    except RemoteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return False
+
+
+def run_import(groups: Sequence[ImportGroup], config: AivenConfig) -> int:
+    connection = connect_to_aiven(config)
+    run_id = str(uuid.uuid4())
+    failed = False
+    try:
+        _ensure_log_table(connection)
+        _ensure_strict_mode(connection)
+        for group in groups:
+            started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            operation = "LOAD"
+            rows_read = 0
+            try:
+                dataset = load_import_group(group)
+                rows_read = len(dataset.rows)
+                operation = _prepare_target_table(
+                    connection, config.database, dataset
                 )
+                _run_dml(connection, dataset)
+            except (InputError, SchemaError, RemoteError, DdlError, DmlError) as exc:
+                failed = True
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+                message = str(exc)
+                _record_log_safely(
+                    connection,
+                    run_id=run_id,
+                    table_name=group.table,
+                    source_path=group.path,
+                    operation=operation,
+                    status="ERROR",
+                    rows_read=rows_read,
+                    rows_inserted=0,
+                    error_message=message,
+                    started_at=started_at,
+                )
+                print(f"error: {group.table}: {message}", file=sys.stderr)
+                continue
+            except Exception:
+                failed = True
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+                message = "operação falhou"
+                _record_log_safely(
+                    connection,
+                    run_id=run_id,
+                    table_name=group.table,
+                    source_path=group.path,
+                    operation=operation,
+                    status="ERROR",
+                    rows_read=rows_read,
+                    rows_inserted=0,
+                    error_message=message,
+                    started_at=started_at,
+                )
+                print(f"error: {group.table}: {message}", file=sys.stderr)
+                continue
+
+            if not _record_log_safely(
+                connection,
+                run_id=run_id,
+                table_name=group.table,
+                source_path=group.path,
+                operation=operation,
+                status="SUCCESS",
+                rows_read=rows_read,
+                rows_inserted=rows_read,
+                error_message=None,
+                started_at=started_at,
+            ):
+                failed = True
+            print(
+                f"table={group.table} | source={group.path} | rows={rows_read} "
+                f"| operation={operation} | status=SUCCESS"
             )
-        for plan in counted:
-            _display_plan(plan)
-        if write:
-            _run_dml(connection, counted)
+        return 1 if failed else 0
     finally:
         try:
             connection.close()
@@ -945,32 +1121,21 @@ def run_import(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Importa CSV/JSON locais para Aiven MySQL com upsert por ID."
+    return argparse.ArgumentParser(
+        description=(
+            "Importa automaticamente os CSV/JSON da pasta data para Aiven MySQL. "
+            "Cria tabelas ausentes e trunca tabelas existentes."
+        )
     )
-    parser.add_argument("input", metavar="INPUT", help="ficheiro CSV/JSON ou diretório")
-    parser.add_argument("--id-column", default="id", help="nome da coluna de ID (default: id)")
-    parser.add_argument("--create-table", action="store_true", help="autoriza CREATE de tabela ausente")
-    parser.add_argument("--add-columns", action="store_true", help="autoriza ALTER de colunas ausentes")
-    parser.add_argument("--write", action="store_true", help="executa DDL/DML; sem isto é dry-run")
-    return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    parser.parse_args(argv)
     try:
-        # This call is intentionally before load_config and before connect.
-        datasets = load_datasets(args.input, args.id_column)
+        groups = discover_import_groups("data")
         config = load_config()
-        run_import(
-            datasets,
-            config,
-            create_table=args.create_table,
-            add_columns=args.add_columns,
-            write=args.write,
-        )
-        return 0
+        return run_import(groups, config)
     except (InputError, ConfigError, SchemaError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -984,5 +1149,5 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
 
-if __name__ == "__main__":  # pragma: no cover - covered by CLI smoke tests.
+if __name__ == "__main__":
     raise SystemExit(main())
