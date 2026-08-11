@@ -1,0 +1,10 @@
+{
+  "baze_cache_energia": {
+    "dataset_id": "consumos-energia",
+    "title": "Consumos de Energia",
+    "description": "Dados relativos aos consumos de energia do Município da Maia.",
+    "keywords": ["energia", "consumo energético"],
+    "publisher": "CMMaia",
+    "theme_ids": ["j9hrafo"]
+  }
+}

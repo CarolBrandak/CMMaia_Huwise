@@ -585,11 +585,11 @@ def _parse_env_file(path: Path) -> dict[str, str]:
             raise ConfigError("linha inválida em .env")
         key, raw_value = line.split("=", 1)
         key = key.strip()
-        if key not in CONFIG_KEYS:
-            raise ConfigError(".env contém uma variável não permitida")
         value = raw_value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
             value = value[1:-1]
+        if key not in CONFIG_KEYS:
+            continue
         if key in values:
             raise ConfigError("variável repetida em .env")
         values[key] = value
