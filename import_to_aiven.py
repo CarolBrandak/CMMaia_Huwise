@@ -95,6 +95,7 @@ class Dataset:
     rows: tuple[Record, ...]
     id_source_name: str
     mergeable: bool = False
+    integer_id: bool = True
 
     @property
     def id_column(self) -> str:
@@ -212,6 +213,15 @@ def _validate_id_text(value: str, seen: set[str]) -> str:
     return value
 
 
+def _validate_integer_id(value: str, seen: set[str]) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value):
+        raise InputError("ID GeoJSON deve ser um numero inteiro nao negativo")
+    number = int(value)
+    if number > 4_294_967_295:
+        raise InputError("ID GeoJSON excede o limite de INT UNSIGNED")
+    return _validate_id_text(str(number), seen)
+
+
 def _decimal_text(value: Decimal) -> str:
     if not value.is_finite():
         raise InputError("número JSON inválido")
@@ -301,7 +311,9 @@ def _load_csv(path: Path, id_source_name: str, table: str) -> Dataset:
                 if len(row) != len(header):
                     raise InputError(f"CSV com largura inválida na linha {line_number}")
                 values = {column.name: value for column, value in zip(columns, row)}
-                id_text = _validate_id_text(values[sanitize_identifier(id_source_name)], seen_ids)
+                id_text = _validate_integer_id(
+                    values[sanitize_identifier(id_source_name)], seen_ids
+                )
                 values[sanitize_identifier(id_source_name)] = id_text
                 rows.append(Record(values))
     except InputError:
@@ -325,6 +337,8 @@ def _load_json(path: Path, id_source_name: str, table: str) -> Dataset:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
         raise InputError("não foi possível ler o JSON") from exc
+    if isinstance(value, dict) and value.get("type") == "FeatureCollection":
+        return _load_geojson(path, id_source_name, table, value)
     if isinstance(value, dict) and {"t", "NReg", "Consumo", "metadata"} <= value.keys():
         return _load_baze_json(path, id_source_name, table, value)
     if not isinstance(value, list):
@@ -360,9 +374,84 @@ def _load_json(path: Path, id_source_name: str, table: str) -> Dataset:
         id_text_value = _json_value(raw_id)
         if id_text_value is None or not isinstance(id_text_value, str):
             raise InputError("ID inválido")
-        normalized[by_source[id_source_name]] = _validate_id_text(id_text_value, seen_ids)
+        normalized[by_source[id_source_name]] = _validate_integer_id(
+            id_text_value, seen_ids
+        )
         rows.append(Record(normalized))
     return Dataset(path, table, columns, tuple(rows), id_source_name)
+
+
+def _load_geojson(
+    path: Path, id_source_name: str, table: str, value: Mapping[str, Any]
+) -> Dataset:
+    features = value.get("features")
+    if not isinstance(features, list):
+        raise InputError("GeoJSON FeatureCollection sem lista features")
+    if any(not isinstance(feature, dict) for feature in features):
+        raise InputError("GeoJSON com feature invalida")
+
+    property_names: list[str] = []
+    seen_properties: set[str] = set()
+    for feature in features:
+        if feature.get("type") != "Feature":
+            raise InputError("GeoJSON FeatureCollection contem um elemento nao Feature")
+        properties = feature.get("properties")
+        if properties is None:
+            properties = {}
+        if not isinstance(properties, dict):
+            raise InputError("GeoJSON Feature com properties invalidas")
+        for name in properties:
+            if not isinstance(name, str):
+                raise InputError("GeoJSON com nome de propriedade invalido")
+            if name not in seen_properties:
+                seen_properties.add(name)
+                property_names.append(name)
+
+    id_from_properties = id_source_name in seen_properties
+    source_names = [id_source_name]
+    source_names.extend(name for name in property_names if name != id_source_name)
+    if "geometry" in source_names:
+        raise InputError("GeoJSON com propriedade reservada geometry")
+    source_names.append("geometry")
+    columns = _columns_from_source_names(source_names)
+    by_source = {column.source_name: column.name for column in columns}
+
+    rows: list[Record] = []
+    seen_ids: set[str] = set()
+    for position, feature in enumerate(features, start=1):
+        properties = feature.get("properties") or {}
+        raw_id = feature.get("id")
+        if raw_id is None and id_from_properties:
+            raw_id = properties.get(id_source_name)
+        if raw_id is None:
+            raw_id = JsonNumber(str(position))
+        if isinstance(raw_id, (list, dict)):
+            raise InputError("ID GeoJSON deve ser escalar")
+        id_text = _json_value(raw_id)
+        if id_text is None:
+            raise InputError("ID GeoJSON nulo")
+
+        normalized: dict[str, str | None] = {
+            by_source[id_source_name]: _validate_integer_id(id_text, seen_ids)
+        }
+        for name, raw_value in properties.items():
+            if name != id_source_name:
+                normalized[by_source[name]] = _json_value(raw_value)
+
+        geometry = feature.get("geometry")
+        if geometry is not None and not isinstance(geometry, dict):
+            raise InputError("GeoJSON Feature com geometry invalida")
+        normalized[by_source["geometry"]] = _json_value(geometry)
+        rows.append(Record(normalized))
+
+    return Dataset(
+        path,
+        table,
+        columns,
+        tuple(rows),
+        id_source_name,
+        integer_id=True,
+    )
 
 
 def _load_baze_json(
@@ -423,6 +512,7 @@ def _load_baze_json(
         tuple(rows),
         id_source_name,
         mergeable=True,
+        integer_id=False,
     )
 
 
@@ -480,6 +570,7 @@ def _merge_datasets(
         tuple(Record(values) for values in rows_by_id.values()),
         first.id_source_name,
         mergeable=True,
+        integer_id=first.integer_id,
     )
 
 
@@ -540,6 +631,7 @@ def load_import_group(group: ImportGroup, id_source_name: str = "id") -> Dataset
             dataset.rows,
             dataset.id_source_name,
             dataset.mergeable,
+            dataset.integer_id,
         )
     return _merge_datasets(datasets, group.path)
 
@@ -812,6 +904,10 @@ def _validate_existing_state(dataset: Dataset, state: TableState) -> None:
         raise SchemaError("a coluna de ID existente deve ser NOT NULL")
     if id_info.data_type not in _INTEGER_TYPES | {"char", "varchar"}:
         raise SchemaError("a coluna de ID deve ser CHAR/VARCHAR ou inteira")
+    if dataset.integer_id and id_info.data_type not in _INTEGER_TYPES:
+        raise SchemaError("a coluna de ID deve ser inteira")
+    if not dataset.integer_id and id_info.data_type not in {"char", "varchar"}:
+        raise SchemaError("a coluna de ID de uma tabela Baze deve ser CHAR/VARCHAR")
 
     id_folded = dataset.id_column.casefold()
     has_id_unique = False
@@ -847,7 +943,8 @@ def _validate_existing_state(dataset: Dataset, state: TableState) -> None:
 
 
 def build_create_table_sql(dataset: Dataset) -> str:
-    definitions = [f"{_quote_identifier(dataset.id_column)} VARCHAR(255) NOT NULL"]
+    id_type = "INT UNSIGNED" if dataset.integer_id else "VARCHAR(255)"
+    definitions = [f"{_quote_identifier(dataset.id_column)} {id_type} NOT NULL"]
     for column in dataset.columns:
         if column.name != dataset.id_column:
             definitions.append(f"{_quote_identifier(column.name)} TEXT NULL")

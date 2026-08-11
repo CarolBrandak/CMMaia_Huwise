@@ -1,0 +1,21 @@
+{
+  "estacoes_percursos": {
+    "dataset_id": null,
+    "resource_id": null,
+    "title": "Estações e percursos no Município da Maia",
+    "description": "Dados geográficos de percursos entre estações e destinos no Município da Maia. Incluem a estação, o destino, a categoria, a distância em metros e a geometria LineString de cada percurso. Fonte: aplicação Maia 2026, trabalho de Ana Martins (https://maia2026.onrender.com/percurso?geojson=todos&categoria=).",
+    "tags": [
+      "maia",
+      "estações",
+      "percursos",
+      "geografia",
+      "mobilidade"
+    ],
+    "license": "notspecified",
+    "frequency": "unknown",
+    "resource_title": "estacoes-percursos.geojson",
+    "resource_description": "Percursos e respetivas geometrias em formato GeoJSON.",
+    "resource_format": "geojson",
+    "geometry_column": "geometry"
+  }
+}
