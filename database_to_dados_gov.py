@@ -10,6 +10,7 @@ import os
 import ssl
 import sys
 import tempfile
+import time as time_module
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -68,7 +69,7 @@ class Settings:
     aiven: AivenConfig
     api_url: str
     api_key: str
-    organization_id: str
+    organization_id: str | None
     private: bool
 
 
@@ -203,7 +204,14 @@ def save_remote_ids(
             json.dumps(value, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        os.replace(temporary_path, path)
+        for attempt in range(5):
+            try:
+                os.replace(temporary_path, path)
+                break
+            except OSError:
+                if attempt == 4:
+                    raise
+                time_module.sleep(0.2 * (attempt + 1))
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         identifiers = ", ".join(
             value
@@ -257,7 +265,6 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         "AIVEN_USER",
         "AIVEN_PASSWORD",
         "DADOS_GOV_API_KEY",
-        "DADOS_GOV_ORGANIZATION_ID",
     )
     missing = [key for key in required if _is_missing(values.get(key))]
     if missing:
@@ -292,7 +299,9 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
             or "https://dados.gov.pt/api/1"
         ),
         api_key=values["DADOS_GOV_API_KEY"].strip(),
-        organization_id=values["DADOS_GOV_ORGANIZATION_ID"].strip(),
+        organization_id=(
+            values.get("DADOS_GOV_ORGANIZATION_ID", "").strip() or None
+        ),
         private=_parse_bool(
             values.get("DADOS_GOV_PRIVATE", "") or "true",
             "DADOS_GOV_PRIVATE",
@@ -645,9 +654,10 @@ def build_dataset_payload(
         "license": str(license_id),
         "frequency": str(frequency),
         "private": private,
-        "organization": settings.organization_id,
         "extras": {"aiven_table": table_config.table},
     }
+    if settings.organization_id is not None:
+        payload["organization"] = settings.organization_id
     if table_config.spatial is not None:
         payload["spatial"] = dict(table_config.spatial)
     return payload
@@ -656,6 +666,7 @@ def build_dataset_payload(
 class DadosGovClient:
     def __init__(self, api_url: str, api_key: str) -> None:
         self.base_url = api_url.rstrip("/")
+        self.current_user_id: str | None = None
         self.session = requests.Session()
         self.session.headers.update(
             {"X-API-KEY": api_key, "Accept": "application/json"}
@@ -707,20 +718,26 @@ class DadosGovClient:
             ) from exc
 
     def validate_access(
-        self, organization_id: str, license_id: str, frequency: str
+        self, organization_id: str | None, license_id: str, frequency: str
     ) -> None:
         me = self.request("GET", "/me/")
-        organizations = me.get("organizations", []) if isinstance(me, dict) else []
-        organization_ids = {
-            str(item.get("id"))
-            for item in organizations
-            if isinstance(item, Mapping) and item.get("id")
-        }
-        if organization_id not in organization_ids:
+        if not isinstance(me, dict) or not me.get("id"):
             raise ScriptError(
-                "a conta da chave API nao pertence a organizacao "
-                f"{organization_id} no dados.gov.pt"
+                "o dados.gov.pt nao devolveu o utilizador associado a chave API"
             )
+        self.current_user_id = str(me["id"])
+        if organization_id is not None:
+            organizations = me.get("organizations", [])
+            organization_ids = {
+                str(item.get("id"))
+                for item in organizations
+                if isinstance(item, Mapping) and item.get("id")
+            }
+            if organization_id not in organization_ids:
+                raise ScriptError(
+                    "a conta da chave API nao pertence a organizacao "
+                    f"{organization_id} no dados.gov.pt"
+                )
 
         licenses = self.request("GET", "/datasets/licenses/")
         valid_licenses = {
@@ -759,16 +776,30 @@ class DadosGovClient:
         if table_config.dataset_id:
             dataset = self.get_dataset(table_config.dataset_id)
             organization = dataset.get("organization")
-            organization_id = (
+            dataset_organization_id = (
                 str(organization.get("id"))
                 if isinstance(organization, Mapping)
                 else ""
             )
-            expected_organization = str(initial_payload["organization"])
-            if organization_id and organization_id != expected_organization:
-                raise ScriptError(
-                    f"o dataset {table_config.dataset_id} pertence a outra organizacao"
+            expected_organization = initial_payload.get("organization")
+            if expected_organization is not None:
+                if dataset_organization_id != str(expected_organization):
+                    raise ScriptError(
+                        f"o dataset {table_config.dataset_id} pertence a outra "
+                        "organizacao ou utilizador"
+                    )
+            else:
+                owner = dataset.get("owner")
+                owner_id = (
+                    str(owner.get("id"))
+                    if isinstance(owner, Mapping) and owner.get("id")
+                    else ""
                 )
+                if dataset_organization_id or owner_id != self.current_user_id:
+                    raise ScriptError(
+                        f"o dataset {table_config.dataset_id} nao pertence ao "
+                        "utilizador da chave API"
+                    )
             return dataset, "UPDATE"
 
         payload = dict(initial_payload)
